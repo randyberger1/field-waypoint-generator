@@ -1,101 +1,117 @@
-import streamlit as st
-import geopandas as gpd
+# waypoint_gen.py
+
 from shapely.geometry import Polygon, LineString
-import matplotlib.pyplot as plt
-import folium
-from streamlit_folium import st_folium
+from shapely.affinity import rotate
+import math
 
-st.set_page_config(page_title="Field Robotics Waypoint Generator", layout="wide")
-st.title("⚽ Field Robotics Waypoint Generator")
+def generate_guidance_lines(
+    field_polygon: Polygon,
+    tool_width: float,
+    num_headland: int = 2,
+    driving_angle_deg: float = 90
+):
+    """
+    Generate guidance lines (waypoints) for automatic grass cutting / marking.
 
-# Sidebar inputs
-st.sidebar.header("🛠 Parameters")
-tool_width = st.sidebar.number_input("Tool Width (m)", min_value=0.1, value=1.0)
-num_headland = st.sidebar.slider("Number of Headland Passes", 1, 10, 2)
-angle = st.sidebar.slider("Driving Direction (degrees)", 0, 180, 90)
+    Args:
+        field_polygon (Polygon): Shapely Polygon of the field boundary.
+        tool_width (float): Width of the cutting or marking tool.
+        num_headland (int): Number of passes around edge (headland).
+        driving_angle_deg (float): Driving direction angle in degrees (0-180).
 
-# Choose input mode
-mode = st.radio("Choose field input mode:", ["📍 Manual Coordinate Entry", "🗺️ Draw on Map"])
+    Returns:
+        List[LineString]: List of clipped, rotated guidance LineStrings.
+    """
 
-def generate_dummy_waypoints(polygon, width, n_headland, direction):
-    minx, miny, maxx, maxy = polygon.bounds
+    # Rotate polygon to align driving direction horizontally
+    rotated_poly = rotate(field_polygon, -driving_angle_deg, origin='centroid', use_radians=False)
+    minx, miny, maxx, maxy = rotated_poly.bounds
+
+    # Offset polygon outward for headland passes
+    headland_offset = num_headland * tool_width
+    outer_poly = rotated_poly.buffer(headland_offset)
+
+    # Generate parallel horizontal lines spaced by tool_width
     lines = []
-    y = miny + width
-    while y < maxy - width:
-        lines.append(LineString([(minx, y), (maxx, y)]))
-        y += width
-    return gpd.GeoDataFrame(geometry=lines, crs="EPSG:4326")
+    y = miny - headland_offset
+    max_y_extended = maxy + headland_offset
 
-if mode == "📍 Manual Coordinate Entry":
-    st.markdown("Enter coordinates in format: `lat, lon` per line")
-    input_text = st.text_area("Coordinates:", height=200, value="""
-40.7128, -74.0060
-40.7128, -74.0000
-40.7160, -74.0000
-40.7160, -74.0060
-""")
+    while y <= max_y_extended:
+        line = LineString([(minx - headland_offset*2, y), (maxx + headland_offset*2, y)])
+        lines.append(line)
+        y += tool_width
 
-    if input_text.strip():
-        try:
-            coords = []
-            for line in input_text.strip().splitlines():
-                lat, lon = map(float, line.split(","))
-                coords.append((lon, lat))  # Geo uses (lon, lat)
+    # Clip lines by the outer polygon (field + headland)
+    clipped_lines = []
+    for line in lines:
+        clipped = line.intersection(outer_poly)
+        if clipped.is_empty:
+            continue
+        if clipped.geom_type == 'MultiLineString':
+            for seg in clipped.geoms:
+                clipped_lines.append(seg)
+        elif clipped.geom_type == 'LineString':
+            clipped_lines.append(clipped)
 
-            if coords[0] != coords[-1]:
-                coords.append(coords[0])
+    # Rotate lines back to original orientation
+    final_lines = [rotate(line, driving_angle_deg, origin=field_polygon.centroid, use_radians=False)
+                   for line in clipped_lines]
 
-            polygon = Polygon(coords)
-            field_gdf = gpd.GeoDataFrame(geometry=[polygon], crs="EPSG:4326")
+    # Sort lines by centroid Y to ensure traversal order
+    final_lines.sort(key=lambda l: l.centroid.y)
 
-            st.success("✅ Polygon created successfully!")
+    return final_lines
 
-            fig, ax = plt.subplots()
-            field_gdf.plot(ax=ax, color='lightgreen', edgecolor='black')
-            st.pyplot(fig)
 
-            # Waypoint generation
-            waypoints_gdf = generate_dummy_waypoints(polygon, tool_width, num_headland, angle)
-            fig2, ax2 = plt.subplots()
-            field_gdf.plot(ax=ax2, color='none', edgecolor='black')
-            waypoints_gdf.plot(ax=ax2, color='red')
-            st.subheader("Generated Waypoints")
-            st.pyplot(fig2)
+def generate_waypoints_from_lines(lines):
+    """
+    Convert guidance lines into an ordered list of waypoints,
+    alternating direction to minimize travel time.
 
-        except Exception as e:
-            st.error(f"Error parsing coordinates: {e}")
+    Args:
+        lines (List[LineString]): List of guidance lines.
 
-elif mode == "🗺️ Draw on Map":
-    st.markdown("🧭 Use the map below to draw a polygon field boundary.")
-    m = folium.Map(location=[40.713, -74.005], zoom_start=15)
-    folium.TileLayer("OpenStreetMap").add_to(m)
-    draw_options = {
-        "polyline": False,
-        "rectangle": False,
-        "circle": False,
-        "circlemarker": False,
-        "marker": False,
-    }
-    draw = st_folium(m, width=700, height=500, returned_objects=["last_drawn"], draw_options=draw_options)
+    Returns:
+        List[Tuple[float, float]]: Ordered waypoint coordinates.
+    """
+    waypoints = []
+    reverse = False
+    for line in lines:
+        coords = list(line.coords)
+        if reverse:
+            coords.reverse()
+        waypoints.extend(coords)
+        reverse = not reverse
+    return waypoints
 
-    if draw and draw.get("last_drawn"):
-        try:
-            coords = draw["last_drawn"]["geometry"]["coordinates"][0]
-            coords = [(pt[0], pt[1]) for pt in coords]
-            polygon = Polygon(coords)
-            field_gdf = gpd.GeoDataFrame(geometry=[polygon], crs="EPSG:4326")
 
-            fig, ax = plt.subplots()
-            field_gdf.plot(ax=ax, color='lightblue', edgecolor='black')
-            st.pyplot(fig)
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    from shapely.geometry import Polygon
 
-            # Generate waypoints
-            waypoints_gdf = generate_dummy_waypoints(polygon, tool_width, num_headland, angle)
-            fig2, ax2 = plt.subplots()
-            field_gdf.plot(ax=ax2, color='none', edgecolor='black')
-            waypoints_gdf.plot(ax=ax2, color='red')
-            st.subheader("Generated Waypoints")
-            st.pyplot(fig2)
+    # Example polygon (100m x 50m rectangle)
+    field = Polygon([(0,0), (100,0), (100,50), (0,50)])
 
-        except Exception as e:
-            st.error(f"Error generating polygon from map: {e}")
+    tool_width = 5.0
+    num_headland = 2
+    driving_angle = 90  # Vertical passes
+
+    guidance_lines = generate_guidance_lines(field, tool_width, num_headland, driving_angle)
+    waypoints = generate_waypoints_from_lines(guidance_lines)
+
+    # Plotting
+    fig, ax = plt.subplots()
+    x, y = field.exterior.xy
+    ax.plot(x, y, color='green', linewidth=2, label='Field Boundary')
+
+    for line in guidance_lines:
+        x, y = line.xy
+        ax.plot(x, y, color='red')
+
+    wp_x, wp_y = zip(*waypoints)
+    ax.scatter(wp_x, wp_y, color='blue', s=15, label='Waypoints')
+
+    ax.set_aspect('equal')
+    ax.legend()
+    ax.set_title('Generated Guidance Lines and Waypoints')
+    plt.show()
