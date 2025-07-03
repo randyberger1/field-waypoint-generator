@@ -1,6 +1,6 @@
-streamlit
+streamlit>=1.36
+folium==0.14.0
+streamlit-folium==0.17.0
 geopandas
 shapely
 matplotlib
-folium
-streamlit-folium
